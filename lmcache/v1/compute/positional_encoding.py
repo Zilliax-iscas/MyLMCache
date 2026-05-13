@@ -170,6 +170,7 @@ def get_fused_rope(
 
     new_rope_params = {
         "rope_theta": base,
+        "rope_type": "default",
         "partial_rotary_factor": partial_rotary_factor,
     }
     if rope_scaling is not None:
@@ -179,12 +180,15 @@ def get_fused_rope(
 
     rope = vllm_get_rope(
         head_size=head_size,
+        rotary_dim=rotary_dim,
         max_position=max_position,
         is_neox_style=is_neox_style,
         rope_parameters=new_rope_params,
         dtype=dtype,
         dual_chunk_attention_config=None,
     )
+    if torch.cuda.is_available():
+        rope = rope.to(torch.device(f"cuda:{torch.cuda.current_device()}"))
 
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
     fused_rope = FusedRope(rope, is_neox_style)

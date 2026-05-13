@@ -1033,13 +1033,20 @@ class LMCacheEngine:
         # synchronize the last layer
         next(mem_obj_consumer)
 
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
-        # Without this, pin_count stays at 1 forever and the CPU staging pool
-        # fills up, causing the next retrieve to deadlock inside allocate().
-        for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
-                mem_obj.unpin()
+        # If this retrieve follows a vLLM lookup, the lookup path pinned the
+        # same cache objects and recorded them in lookup_pins[req_id].  The
+        # vLLM adapter releases those pins via lookup_unpin(req_id) in
+        # wait_for_save(), so do not unpin them here as well.
+        req_lookup_pinned = req_id in self.lookup_pins
+        if not req_lookup_pinned:
+            # Unpin any disk-loaded staging objects now that the device-side
+            # sync has been enqueued (mem_obj_consumer advanced past its sync
+            # point). Without this, pin_count stays at 1 forever and the CPU
+            # staging pool fills up, causing the next retrieve to deadlock
+            # inside allocate().
+            for mem_obj in to_count_down:
+                if mem_obj.is_pinned:
+                    mem_obj.unpin()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)

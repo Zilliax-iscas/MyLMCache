@@ -3,7 +3,9 @@
 from dataclasses import asdict
 import argparse
 import contextlib
+import json
 import os
+from pathlib import Path
 import time
 
 # Third Party
@@ -100,6 +102,45 @@ def print_output(
     print("-" * 50)
 
 
+def encode_without_bos(tokenizer: AutoTokenizer, text: str) -> list[int]:
+    token_ids = tokenizer.encode(text)
+    if token_ids and token_ids[0] == tokenizer.bos_token_id:
+        return token_ids[1:]
+    return token_ids
+
+
+def build_cacheblend_prompt(
+    tokenizer: AutoTokenizer,
+    example: dict,
+    blend_special_tokens: list[int],
+    chunk_order: list[int],
+) -> list[int]:
+    chunk_prompts = [example[str(i)] for i in range(example["chunk_num"])]
+    sys_prompt = encode_without_bos(
+        tokenizer,
+        "You are a very helpful assistant. "
+        "Answer the question based on the given passages.\n\n",
+    )
+    query_prompt = encode_without_bos(tokenizer, example["query"])
+
+    prompt = sys_prompt
+    for chunk_idx in chunk_order:
+        prompt += blend_special_tokens
+        prompt += encode_without_bos(tokenizer, chunk_prompts[chunk_idx])
+    prompt += blend_special_tokens
+    prompt += query_prompt
+    return prompt
+
+
+def load_cacheblend_examples(input_dir: str, num_samples: int) -> list[tuple[int, dict]]:
+    examples = []
+    for sample_idx in range(1, num_samples + 1):
+        input_path = Path(input_dir) / f"{sample_idx}.json"
+        with open(input_path) as f:
+            examples.append((sample_idx, json.load(f)))
+    return examples
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -127,6 +168,27 @@ def parse_args():
         action="store_true",
     )
 
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default="/home/sco/code/CacheBlend/inputs",
+        help="Directory containing CacheBlend JSON samples.",
+    )
+
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=10,
+        help="Number of CacheBlend numbered samples to run.",
+    )
+
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=10,
+        help="Number of tokens to generate for each request.",
+    )
+
     return parser.parse_args()
 
 
@@ -143,74 +205,39 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model)
 
     with build_llm_with_lmcache(lmcache_connector, model) as llm:
-        # Define the shared prompt and specific prompts
         warmup_prompt = tokenizer.encode("Nice to meet you" * 500)[1:]
-        sys_prompt = [1, 733, 16289, 28793] + tokenizer.encode(
-            "You are a very helpful assistant. "
-            "Please answer the question with instructions."
-        )
-        chunk1_prompt = tokenizer.encode("Hello, how are you?" * 500)[1:]
-        chunk2_prompt = tokenizer.encode("Hello, what's up?" * 500)[1:]
-        chunk3_prompt = tokenizer.encode("Hi, what are you up to?" * 500)[1:]
         blend_special_str = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
-
-        first_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, my name is")[1:]
-            + [733, 28748, 16289, 28793]
+        sampling_params = SamplingParams(
+            temperature=0, top_p=0.95, max_tokens=args.max_tokens
         )
-
-        second_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, how are you?")[1:]
-            + [733, 28748, 16289, 28793]
-        )
-
-        third_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, what's up?")[1:]
-            + [733, 28748, 16289, 28793]
-        )
-
-        sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
 
         print_output(llm, warmup_prompt, sampling_params, "warmup")
 
-        # Print the first output
-        print_output(llm, first_prompt, sampling_params, "first")
+        for sample_idx, example in load_cacheblend_examples(
+            args.input_dir, args.num_samples
+        ):
+            chunk_num = example["chunk_num"]
+            original_order = list(range(chunk_num))
+            reuse_order = original_order[1:] + original_order[:1]
 
-        time.sleep(1)
+            first_prompt = build_cacheblend_prompt(
+                tokenizer, example, blend_special_str, original_order
+            )
+            second_prompt = build_cacheblend_prompt(
+                tokenizer, example, blend_special_str, reuse_order
+            )
 
-        # print the second output
-        print_output(
-            llm, second_prompt, sampling_params, "second (warming up blend code path)"
-        )
+            print(f"Running CacheBlend sample {sample_idx} ({chunk_num} chunks)")
+            print_output(llm, first_prompt, sampling_params, f"sample {sample_idx} first")
 
-        time.sleep(1)
+            time.sleep(1)
 
-        # print the third output
-        print_output(llm, third_prompt, sampling_params, "third")
+            print_output(
+                llm,
+                second_prompt,
+                sampling_params,
+                f"sample {sample_idx} reordered",
+            )
 
 
 if __name__ == "__main__":

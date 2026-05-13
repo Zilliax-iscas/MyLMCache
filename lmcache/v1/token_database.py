@@ -519,6 +519,9 @@ class SegmentTokenDatabase(TokenDatabase):
                 if idx > 0:
                     start_idx += self.sep_len
                     end_idx += self.sep_len
+                if token_chunk_len == 0:
+                    start_idx = end_idx
+                    continue
                 if start_idx >= num_falses:
                     if make_key:
                         yield (
