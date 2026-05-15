@@ -993,21 +993,108 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
+            prefetch_handle = kwargs.get("decode_overlap_prefetch_handle")
+            allow_prefetched_final_slots = bool(
+                kwargs.get("allow_decode_overlap_final_slot", False)
             )
+            use_prefetched_layers = (
+                prefetch_handle is not None
+                and prefetch_handle.can_supply_layerwise(
+                    starts,
+                    ends,
+                    self.num_layers,
+                )
+            )
+            prefetched_layer_count = (
+                prefetch_handle.ready_layer_count() if use_prefetched_layers else 0
+            )
+            use_prefetched_final_slots = (
+                allow_prefetched_final_slots
+                and prefetch_handle is not None
+                and hasattr(self.gpu_connector, "batched_to_gpu_final_slots")
+                and prefetch_handle.can_supply_final_slots(
+                    starts,
+                    ends,
+                    self.num_layers,
+                )
+            )
+            if use_prefetched_layers:
+                logger.info(
+                    "[req_id=%s] Using decode-overlap prefetched GPU KV for first "
+                    "%d/%d layerwise retrieve layers.",
+                    req_id,
+                    prefetched_layer_count,
+                    self.num_layers,
+                )
+                get_generator = (
+                    self.storage_manager.layerwise_batched_get(
+                        keys_layer_major[prefetched_layer_count:],
+                        location=location,
+                    )
+                    if prefetched_layer_count < self.num_layers
+                    else None
+                )
+            elif use_prefetched_final_slots:
+                logger.info(
+                    "[req_id=%s] Using decode-overlap prefetched CPU KV for "
+                    "direct async H2D into vLLM final KV slots.",
+                    req_id,
+                )
+                get_generator = None
+            else:
+                if prefetch_handle is not None:
+                    logger.info(
+                        "[req_id=%s] Decode-overlap prefetched KV not usable for "
+                        "this retrieve: retrieve_spans=%s-%s, prefetch_spans=%s-%s, "
+                        "ready_layers=%d/%d, mock_only=%s",
+                        req_id,
+                        starts,
+                        ends,
+                        prefetch_handle.starts,
+                        prefetch_handle.ends,
+                        prefetch_handle.ready_layer_count()
+                        if hasattr(prefetch_handle, "ready_layer_count")
+                        else -1,
+                        self.num_layers,
+                        getattr(prefetch_handle, "mock_only", None),
+                    )
+                get_generator = self.storage_manager.layerwise_batched_get(
+                    keys_layer_major,
+                    location=location,
+                )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            if use_prefetched_layers and hasattr(
+                self.gpu_connector, "batched_to_gpu_prefetched_layers"
+            ):
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu_prefetched_layers(
+                    starts,
+                    ends,
+                    **kwargs,
+                )
+            elif use_prefetched_final_slots:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu_final_slots(
+                    starts,
+                    ends,
+                    **kwargs,
+                )
+            else:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                    starts,
+                    ends,
+                    **kwargs,
+                )
             next(mem_obj_consumer)
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
-
-                assert task is not None
+                if use_prefetched_final_slots:
+                    mem_objs_layer = prefetch_handle.get_source_layer(layer_id)
+                elif not use_prefetched_layers or layer_id >= prefetched_layer_count:
+                    assert get_generator is not None
+                    task = next(get_generator)
+                    assert task is not None
 
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
@@ -1016,12 +1103,17 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
+                if use_prefetched_layers and layer_id < prefetched_layer_count:
+                    mem_objs_layer = prefetch_handle.get_layer(layer_id)
+                elif not use_prefetched_final_slots:
+                    mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
+            if use_prefetched_final_slots:
+                prefetch_handle._released_sources = True
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

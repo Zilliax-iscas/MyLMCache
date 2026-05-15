@@ -41,6 +41,7 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.decode_overlap_prefetch import DecodeOverlapPrefetchRegistry
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -565,6 +566,26 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        self.enable_decode_overlap_prefetch = bool(
+            config.get_extra_config_value("enable_decode_overlap_prefetch", False)
+        )
+        self.decode_overlap_prefetch_consume_wait_ms = float(
+            config.get_extra_config_value(
+                "decode_overlap_prefetch_consume_wait_ms",
+                20.0,
+            )
+        )
+        self.decode_overlap_prefetch = DecodeOverlapPrefetchRegistry.get_or_create(
+            ENGINE_NAME
+        )
+        if self.lmcache_engine is not None and role != KVConnectorRole.SCHEDULER:
+            self.decode_overlap_prefetch.register_worker_engine(self.lmcache_engine)
+        if self.enable_decode_overlap_prefetch:
+            logger.info(
+                "Decode-overlap KV prefetch framework is enabled for role %s. "
+                "CPU->GPU staging is enabled when a worker engine is available.",
+                role,
+            )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -791,7 +812,28 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if masked_token_count >= lmcache_cached_tokens:
+                logger.info(
+                    "Skipping LMCache load for req_id=%s because all %d LMCache "
+                    "hit tokens are already covered by vLLM cached tokens.",
+                    request.req_id,
+                    lmcache_cached_tokens,
+                )
+                continue
             if self.use_layerwise:
+                prefetch_handle = None
+                if self.enable_decode_overlap_prefetch:
+                    prefetch_handle = self.decode_overlap_prefetch.consume_ready(
+                        request.req_id,
+                        timeout_s=self.decode_overlap_prefetch_consume_wait_ms
+                        / 1000.0,
+                    )
+                    if prefetch_handle is not None:
+                        self.decode_overlap_prefetch.mock_copy_to_vllm_slots(
+                            prefetch_handle,
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        )
                 if idx == last_idx:
                     sync = True
                 else:
@@ -807,6 +849,7 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
+                        decode_overlap_prefetch_handle=prefetch_handle,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -817,6 +860,8 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
+                        decode_overlap_prefetch_handle=prefetch_handle,
+                        allow_decode_overlap_final_slot=True,
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
@@ -1081,6 +1126,8 @@ class LMCacheConnectorV1Impl:
             )
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
+                if self.enable_decode_overlap_prefetch:
+                    self.decode_overlap_prefetch.finish(request.req_id)
 
             return
 
@@ -1093,6 +1140,8 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+                if self.enable_decode_overlap_prefetch:
+                    self.decode_overlap_prefetch.finish(request.req_id)
             return
 
         assert len(self.kv_caches) > 0
@@ -1106,6 +1155,8 @@ class LMCacheConnectorV1Impl:
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
+            if self.enable_decode_overlap_prefetch:
+                self.decode_overlap_prefetch.finish(request.req_id)
 
             save_spec = request.save_spec
             if (
@@ -1435,7 +1486,35 @@ class LMCacheConnectorV1Impl:
             can_load=False,
         )
 
+        if (
+            self.enable_decode_overlap_prefetch
+            and not below_min_retrieve
+            and need_to_allocate > 0
+        ):
+            prefetch_mask = torch.ones(num_external_hit_tokens, dtype=torch.bool)
+            masked_token_count = (
+                num_computed_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            prefetch_mask[:masked_token_count] = False
+            self.decode_overlap_prefetch.submit_intent(
+                req_id=req_id,
+                token_count=len(token_ids),
+                lmcache_hit_tokens=num_external_hit_tokens,
+                vllm_cached_tokens=num_computed_tokens,
+                tokens=token_ids[:num_external_hit_tokens],
+                mask=prefetch_mask,
+                request_configs=request_configs,
+                note="scheduler_lookup_hit",
+            )
+
         if below_min_retrieve or need_to_allocate <= 0:
+            if self.enable_decode_overlap_prefetch:
+                self.decode_overlap_prefetch.cancel(
+                    req_id,
+                    reason="no external tokens need loading",
+                )
             return 0
 
         # TODO: Align to vLLM block size. Should test whether it can be removed
@@ -1490,6 +1569,11 @@ class LMCacheConnectorV1Impl:
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            if self.enable_decode_overlap_prefetch:
+                self.decode_overlap_prefetch.cancel(
+                    request.request_id,
+                    reason="allocated request has no external tokens to load",
+                )
             return
 
         recalc_last = (
@@ -1539,6 +1623,11 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
+            if self.enable_decode_overlap_prefetch:
+                self.decode_overlap_prefetch.cancel(
+                    finished_req_id,
+                    reason="request finished before prefetch consumption",
+                )
 
         # We should load KV for:
         # 1. new requests
@@ -1768,6 +1857,11 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
+        if self.enable_decode_overlap_prefetch:
+            self.decode_overlap_prefetch.cancel(
+                request.request_id,
+                reason="request finished",
+            )
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:

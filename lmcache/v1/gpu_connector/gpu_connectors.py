@@ -29,11 +29,26 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
 from lmcache.v1.metadata import LMCacheMetadata
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+class _StagedMemoryObj:
+    """MemoryObj-like wrapper for a temporary full-layer GPU compute buffer."""
+
+    def __init__(self, tensor_value: torch.Tensor, metadata: MemoryObjMetadata):
+        self.tensor_value = tensor_value
+        self.metadata = metadata
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self.tensor_value
+
+    def ref_count_down(self) -> None:
+        return None
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -902,6 +917,297 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         yield
+
+    @_lmcache_nvtx_annotate
+    def batched_to_gpu_prefetched_layers(
+        self, starts: List[int], ends: List[int], **kwargs
+    ):
+        """
+        Attach decode-overlap prefetched GPU compute buffers for CacheBlend.
+
+        Unlike ``batched_to_gpu``, this path does not copy retrieved KV from CPU
+        to the layerwise GPU buffer on the request critical path.  The supplied
+        memory object for each layer already owns a GPU tensor with shape
+        [2, num_tokens, hidden_dim].  We expose it through ``buffer_mapping`` so
+        ``process_qkv`` can recompute directly on prefetched KV, then move the
+        recomputed result to vLLM paged KV slots with the same two-layer delay as
+        the normal layerwise path.
+
+        When proactive prefetch only staged the first few layers, later layers
+        arrive as normal CPU chunk MemoryObjs.  In that mixed case we build the
+        same full-layer GPU compute buffer here, preserving the existing
+        layerwise retrieve behavior for the non-prefetched suffix.
+        """
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        if self.fused_rotary_emb is None and self.cache_positions:
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+
+            self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+            self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        self._lazy_initialize_buffer(self.kvcaches)
+
+        num_all_tokens = ends[-1] - starts[0]
+        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
+
+        gap_mask = torch.ones(
+            num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
+        )
+        buf_offset = starts[0]
+        for start, end in zip(starts, ends, strict=False):
+            gap_mask[start - buf_offset : end - buf_offset] = False
+        self.current_gap_positions = torch.where(gap_mask)[0]
+
+        if self.cache_positions:
+            new_positions_full = torch.arange(
+                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+            )
+
+        staged_gpu_buffer_obj = None
+        for layer_id in range(self.num_layers + 2):
+            if layer_id > 1:
+                lmc_ops.single_layer_kv_transfer(
+                    self.buffer_mapping[layer_id - 2].tensor,
+                    self.kvcaches[layer_id - 2],
+                    slot_mapping_full,
+                    lmc_ops.TransferDirection.H2D,
+                    self.gpu_kv_format,
+                    token_major=False,
+                )
+                del self.buffer_mapping[layer_id - 2]
+
+                logger.debug(
+                    "Finished loading prefetched layer %d into paged memory",
+                    layer_id - 2,
+                )
+
+            if layer_id > 0 and layer_id <= self.num_layers:
+                assert staged_gpu_buffer_obj is not None
+                assert staged_gpu_buffer_obj.tensor is not None
+
+                if self.cache_positions:
+                    old_positions_full = staged_gpu_buffer_obj.metadata.cached_positions
+                    assert old_positions_full is not None
+                    staged_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                        old_positions_full,
+                        new_positions_full,
+                        staged_gpu_buffer_obj.tensor[0],
+                    )
+
+                if self.current_gap_positions.numel():
+                    staged_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+
+                self.buffer_mapping[layer_id - 1] = staged_gpu_buffer_obj
+                logger.debug(
+                    "Attached prefetched GPU buffer for layer %d", layer_id - 1
+                )
+
+            if layer_id < self.num_layers:
+                memory_objs_layer = yield
+                is_full_gpu_staged_layer = (
+                    len(memory_objs_layer) == 1
+                    and memory_objs_layer[0].tensor.is_cuda
+                    and memory_objs_layer[0].tensor.shape[1] == num_all_tokens
+                )
+                if is_full_gpu_staged_layer:
+                    staged_gpu_buffer_obj = memory_objs_layer[0]
+                else:
+                    staged_tensor = torch.empty(
+                        self.get_shape(num_all_tokens),
+                        dtype=self.dtype,
+                        device=self.kvcaches[0].device,
+                    )
+                    staged_tensor.zero_()
+                    if self.cache_positions:
+                        old_positions_full = torch.zeros(
+                            (num_all_tokens,),
+                            dtype=torch.int64,
+                            device=self.kvcaches[0].device,
+                        )
+                    else:
+                        old_positions_full = None
+
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                        staged_tensor[:, start - buf_offset : end - buf_offset].copy_(
+                            memory_obj.tensor,
+                            non_blocking=True,
+                        )
+                        if (
+                            self.cache_positions
+                            and memory_obj.metadata.cached_positions is not None
+                        ):
+                            assert old_positions_full is not None
+                            old_positions_full[
+                                start - buf_offset : end - buf_offset
+                            ].copy_(
+                                memory_obj.metadata.cached_positions.to(
+                                    device=self.kvcaches[0].device,
+                                    dtype=torch.int64,
+                                    non_blocking=True,
+                                ),
+                                non_blocking=True,
+                            )
+
+                    metadata = MemoryObjMetadata(
+                        shape=staged_tensor.shape,
+                        dtype=staged_tensor.dtype,
+                        address=staged_tensor.data_ptr(),
+                        phy_size=staged_tensor.numel() * staged_tensor.element_size(),
+                        ref_count=1,
+                        fmt=MemoryFormat.KV_2TD,
+                        cached_positions=old_positions_full,
+                    )
+                    staged_gpu_buffer_obj = _StagedMemoryObj(
+                        tensor_value=staged_tensor,
+                        metadata=metadata,
+                    )
+            elif layer_id == self.num_layers:
+                yield
+
+        assert len(self.buffer_mapping) == 0, (
+            "There are still layers in the buffer mapping after "
+            "releasing prefetched GPU buffers."
+        )
+
+        yield
+
+    @_lmcache_nvtx_annotate
+    def batched_to_gpu_final_slots(self, starts: List[int], ends: List[int], **kwargs):
+        """
+        Move layerwise KV cache directly from CPU MemoryObj tensors to vLLM
+        paged KV cache slots.
+
+        This is the decode-overlap fast path: it avoids the intermediate GPU
+        staging buffer used by ``batched_to_gpu``. For CacheBlend correctness we
+        still apply the RoPE position correction in-place on the final K slots.
+        Currently this direct path is limited to vLLM NHD flash-attention layout.
+        """
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        if self.fused_rotary_emb is None and self.cache_positions:
+            # First Party
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+
+            self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+            self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        self._lazy_initialize_buffer(self.kvcaches)
+        if self.gpu_kv_format != lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
+            raise NotImplementedError(
+                "decode-overlap final-slot direct H2D currently supports only "
+                f"vLLM NHD flash-attention layout, got {self.gpu_kv_format}"
+            )
+
+        num_all_tokens = ends[-1] - starts[0]
+        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
+
+        gap_mask = torch.ones(
+            num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
+        )
+        buf_offset = starts[0]
+        for start, end in zip(starts, ends, strict=False):
+            gap_mask[start - buf_offset : end - buf_offset] = False
+        gap_slots = slot_mapping_full[torch.where(gap_mask)[0]]
+
+        current_stream = torch.cuda.current_stream()
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = yield
+
+            with torch.cuda.stream(self.load_stream):
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                    slot_mapping_chunk = slot_mapping[start:end]
+                    lmc_ops.single_layer_kv_transfer(
+                        memory_obj.tensor,
+                        self.kvcaches[layer_id],
+                        slot_mapping_chunk,
+                        lmc_ops.TransferDirection.H2D,
+                        self.gpu_kv_format,
+                        token_major=False,
+                    )
+
+                    if self.cache_positions:
+                        old_positions = memory_obj.metadata.cached_positions
+                        new_positions = torch.arange(
+                            start,
+                            end,
+                            dtype=torch.int64,
+                            device=slot_mapping_chunk.device,
+                        )
+                        self._apply_rope_to_final_k_slots(
+                            layer_id,
+                            slot_mapping_chunk,
+                            old_positions,
+                            new_positions,
+                        )
+
+                if gap_slots.numel():
+                    flat_kv = self._get_final_kv_flat(layer_id)
+                    flat_kv[:, gap_slots] = 0.0
+
+            current_stream.wait_stream(self.load_stream)
+            logger.debug(
+                "Finished direct final-slot loading for layer %d", layer_id
+            )
+
+        yield
+
+    def _get_final_kv_flat(self, layer_id: int) -> torch.Tensor:
+        assert self.kvcaches is not None
+        kvcache = self.kvcaches[layer_id]
+        # Current vLLM flash-attn NHD layout: [2, num_blocks, block_size,
+        # num_heads, head_size]. Flatten paged blocks into slot ids.
+        return kvcache.view(
+            2,
+            -1,
+            kvcache.shape[-2],
+            kvcache.shape[-1],
+        )
+
+    def _apply_rope_to_final_k_slots(
+        self,
+        layer_id: int,
+        slot_mapping: torch.Tensor,
+        old_positions: torch.Tensor,
+        new_positions: torch.Tensor,
+    ) -> None:
+        assert self.fused_rotary_emb is not None
+        flat_kv = self._get_final_kv_flat(layer_id)
+        old_positions = old_positions.to(
+            device=slot_mapping.device, dtype=torch.int64, non_blocking=True
+        )
+        k_slots = flat_kv[0, slot_mapping]
+        original_shape = k_slots.shape
+        rotated = self.fused_rotary_emb(
+            old_positions,
+            new_positions,
+            k_slots.reshape(k_slots.shape[0], -1),
+        )
+        flat_kv[0, slot_mapping] = rotated.reshape(original_shape)
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`
     # and `batched_from_gpu`.
