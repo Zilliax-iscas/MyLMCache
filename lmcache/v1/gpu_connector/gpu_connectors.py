@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import os
 
 # Third Party
 import torch
@@ -655,6 +656,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+        self.last_blend_transfer_profile: dict[str, object] = {}
 
     @classmethod
     def from_metadata(
@@ -762,6 +764,27 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
+        profile_enabled = os.getenv("LMCACHE_BLEND_PROFILE", "False").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        h2d_ms_by_layer: list[float] = [0.0 for _ in range(self.num_layers)]
+        paged_write_ms_by_layer: list[float] = [0.0 for _ in range(self.num_layers)]
+        h2d_bytes_by_layer: list[int] = [0 for _ in range(self.num_layers)]
+        paged_write_bytes_by_layer: list[int] = [0 for _ in range(self.num_layers)]
+        pending_h2d_events = []
+        pending_paged_events = []
+
+        def flush_completed_events():
+            for layer, start_event, end_event in pending_h2d_events:
+                h2d_ms_by_layer[layer] += start_event.elapsed_time(end_event)
+            pending_h2d_events.clear()
+            for layer, start_event, end_event in pending_paged_events:
+                paged_write_ms_by_layer[layer] += start_event.elapsed_time(end_event)
+            pending_paged_events.clear()
+
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -827,21 +850,36 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             )
         for layer_id in range(self.num_layers + 2):
             if layer_id > 1:
+                paged_layer_id = layer_id - 2
+                if profile_enabled:
+                    paged_start = torch.cuda.Event(enable_timing=True)
+                    paged_end = torch.cuda.Event(enable_timing=True)
+                    paged_start.record()
+                    paged_write_bytes_by_layer[paged_layer_id] += (
+                        self.buffer_mapping[paged_layer_id].tensor.nbytes
+                    )
                 lmc_ops.single_layer_kv_transfer(
-                    self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
+                    self.buffer_mapping[paged_layer_id].tensor,
+                    self.kvcaches[paged_layer_id],
                     slot_mapping_full,
                     lmc_ops.TransferDirection.H2D,
                     self.gpu_kv_format,
                     token_major=False,  # shape is [2, num_tokens, hidden_dim]
                 )
-                del self.buffer_mapping[layer_id - 2]
+                if profile_enabled:
+                    paged_end.record()
+                    pending_paged_events.append(
+                        (paged_layer_id, paged_start, paged_end)
+                    )
+                del self.buffer_mapping[paged_layer_id]
 
-                logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
+                logger.debug(f"Finished loading layer {paged_layer_id} into paged memory")
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
                 torch.cuda.synchronize()
+                if profile_enabled:
+                    flush_completed_events()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -871,11 +909,17 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
                 # memobj -> gpu_buffer
                 with torch.cuda.stream(self.load_stream):
+                    if profile_enabled:
+                        h2d_start = torch.cuda.Event(enable_timing=True)
+                        h2d_end = torch.cuda.Event(enable_timing=True)
+                        h2d_start.record(self.load_stream)
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                         assert load_gpu_buffer_obj.tensor is not None
+                        if profile_enabled:
+                            h2d_bytes_by_layer[layer_id] += memory_obj.tensor.nbytes
                         load_gpu_buffer_obj.tensor[0][
                             start - buf_offset : end - buf_offset
                         ].copy_(memory_obj.tensor[0], non_blocking=True)
@@ -888,9 +932,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.cached_positions
+                    if profile_enabled:
+                        h2d_end.record(self.load_stream)
+                        pending_h2d_events.append((layer_id, h2d_start, h2d_end))
 
             elif layer_id == self.num_layers:
                 yield
+
+            if profile_enabled and layer_id == self.num_layers + 1:
+                torch.cuda.synchronize()
+                flush_completed_events()
 
         # free the buffer memory
         load_gpu_buffer_obj.ref_count_down()
@@ -900,6 +951,26 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             "There are still layers in the buffer mapping after "
             "releasing the GPU buffers."
         )
+
+        if profile_enabled:
+            h2d_total_ms = sum(h2d_ms_by_layer)
+            paged_write_total_ms = sum(paged_write_ms_by_layer)
+            self.last_blend_transfer_profile = {
+                "h2d_ms_by_layer": h2d_ms_by_layer,
+                "paged_write_ms_by_layer": paged_write_ms_by_layer,
+                "h2d_total_ms": h2d_total_ms,
+                "paged_write_total_ms": paged_write_total_ms,
+                "kv_transfer_total_ms": h2d_total_ms + paged_write_total_ms,
+                "h2d_bytes_by_layer": h2d_bytes_by_layer,
+                "paged_write_bytes_by_layer": paged_write_bytes_by_layer,
+            }
+            logger.info(
+                "[BlendProfile] KV transfer: h2d=%.3f ms, paged_write=%.3f ms, "
+                "total=%.3f ms",
+                h2d_total_ms,
+                paged_write_total_ms,
+                h2d_total_ms + paged_write_total_ms,
+            )
 
         yield
 

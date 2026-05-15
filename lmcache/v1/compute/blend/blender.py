@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional, Union
+import json
+import os
+import time
 
 # Third Party
 import torch
@@ -55,6 +58,7 @@ class LMCBlender:
             attn_mask=None,
             positions=None,
         )
+        self.last_profile: dict[str, object] = {}
 
     def process_qkv(
         self,
@@ -68,6 +72,9 @@ class LMCBlender:
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
+        if self.metadata.kv_len is not None:
+            old_k = old_k[: self.metadata.kv_len]
+            old_v = old_v[: self.metadata.kv_len]
 
         if attn_output is None:
             attn_output = torch.empty(
@@ -86,6 +93,28 @@ class LMCBlender:
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
         if layer_id in self.common_metadata.check_layers:
+            if k.shape[0] != old_k.shape[0]:
+                common_len = min(k.shape[0], old_k.shape[0])
+                logger.warning(
+                    "Blend KV length mismatch at layer %s: computed=%s, "
+                    "retrieved=%s. Using common length %s. This usually means "
+                    "the reusable KV span is partial or not aligned with the "
+                    "current prefill span.",
+                    layer_id,
+                    k.shape[0],
+                    old_k.shape[0],
+                    common_len,
+                )
+                if common_len == 0:
+                    return q, k, v, residual, attn_output, attn_metadata
+                q = q[:common_len]
+                k = k[:common_len]
+                v = v[:common_len]
+                residual = residual[:common_len]
+                old_k = old_k[:common_len]
+                old_v = old_v[:common_len]
+                self.metadata.positions = self.metadata.positions[:common_len]
+            self.metadata.kv_len = old_k.shape[0]
             diff_k = torch.sum(
                 (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
             )
@@ -132,22 +161,77 @@ class LMCBlender:
         """
 
         # TODO(Jiayi): store is currently not included in this function
+        profile_enabled = os.getenv("LMCACHE_BLEND_PROFILE", "False").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        blend_start = time.perf_counter()
+        retrieve_step_wall_ms = 0.0
+        model_step_wall_ms = 0.0
+        if profile_enabled:
+            self.last_profile = {}
+            if hasattr(self.gpu_connector, "last_blend_transfer_profile"):
+                self.gpu_connector.last_blend_transfer_profile = {}
 
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
+        step_start = time.perf_counter()
         next(layerwise_retriever)
+        retrieve_step_wall_ms += (time.perf_counter() - step_start) * 1000
         yield
 
         for i in range(self.num_layers):
+            step_start = time.perf_counter()
             next(layerwise_retriever)
+            retrieve_step_wall_ms += (time.perf_counter() - step_start) * 1000
+            step_start = time.perf_counter()
             next(layerwise_model_executor)
+            model_step_wall_ms += (time.perf_counter() - step_start) * 1000
             yield
 
+        step_start = time.perf_counter()
         next(layerwise_retriever)
+        retrieve_step_wall_ms += (time.perf_counter() - step_start) * 1000
 
         self.metadata.clean()
+        if profile_enabled:
+            transfer_profile = getattr(
+                self.gpu_connector, "last_blend_transfer_profile", {}
+            )
+            total_ms = (time.perf_counter() - blend_start) * 1000
+            self.last_profile = {
+                "req_id": kwargs.get("request_id", kwargs.get("req_id")),
+                "blend_total_ms": total_ms,
+                "retrieve_step_wall_ms": retrieve_step_wall_ms,
+                "model_step_wall_ms": model_step_wall_ms,
+                **transfer_profile,
+            }
+            self._write_profile_record(self.last_profile)
+            logger.info(
+                "[BlendProfile] blend_total=%.3f ms, retrieve_step_wall=%.3f ms, "
+                "model_step_wall=%.3f ms",
+                total_ms,
+                retrieve_step_wall_ms,
+                model_step_wall_ms,
+            )
         yield
+
+    @staticmethod
+    def _write_profile_record(profile: dict[str, object]):
+        profile_path = os.getenv("LMCACHE_BLEND_PROFILE_FILE")
+        if not profile_path:
+            return
+
+        record = dict(profile)
+        record["timestamp"] = time.time()
+        try:
+            with open(profile_path, "a") as profile_file:
+                profile_file.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to write blend profile record: %s", exc)
 
     def blend(
         self,
