@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass
 import argparse
 import contextlib
+import gc
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,6 @@ import threading
 import time
 from typing import Optional
 
-# Third Party
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
@@ -19,6 +19,19 @@ from vllm.engine.arg_utils import EngineArgs
 # First Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
+
+
+MUSIQUE_PREFIX_PROMPT = (
+    "You will be asked a question after reading several passages. "
+    "Please directly answer the question based on the given passages. "
+    "Do NOT repeat the question. The answer should be within 5 words..\n"
+    "Passages:\n"
+)
+MUSIQUE_QUERY_PROMPT = (
+    "\n\nAnswer the question directly based on the given passages. "
+    "Do NOT repeat the question. The answer should be within 5 words. \n"
+    "Question:"
+)
 
 
 @dataclass
@@ -49,6 +62,7 @@ def setup_environment_variables(
     enable_decode_overlap_prefetch: bool = False,
     proactive_prefetch_hint_file: Optional[str] = None,
     decode_overlap_initial_layers: Optional[int] = None,
+    local_cpu_size_gb: float = 5.0,
 ):
     # LMCache-related environment variables
 
@@ -104,8 +118,7 @@ def setup_environment_variables(
         # Enable local CPU backend in LMCache
         os.environ["LMCACHE_LOCAL_CPU"] = "True"
 
-        # Set the maximum size of the local CPU size to 5GB
-        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
+        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = str(local_cpu_size_gb)
 
 
 @contextlib.contextmanager
@@ -128,8 +141,14 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
     try:
         yield llm
     finally:
+        engine_core = getattr(getattr(llm, "llm_engine", None), "engine_core", None)
+        if engine_core is not None and hasattr(engine_core, "shutdown"):
+            engine_core.shutdown()
+        del llm
         # Clean up lmcache backend
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        gc.collect()
+        time.sleep(2)
 
 
 def print_output(
@@ -274,6 +293,36 @@ def build_cacheblend_prompt(
     return prompt
 
 
+def normalize_question(question: str) -> str:
+    if not question.endswith("?"):
+        question += "?"
+    return question[0].lower() + question[1:]
+
+
+def build_musique_prompt(
+    tokenizer: AutoTokenizer,
+    example: dict,
+    blend_special_tokens: list[int],
+    passage_order: list[int],
+) -> list[int]:
+    prompt = encode_without_bos(tokenizer, MUSIQUE_PREFIX_PROMPT)
+    passage_prompts = [
+        f"{ctx.get('title', '')}\n\n{ctx['text']}\n\n" for ctx in example["ctxs"]
+    ]
+
+    for passage_idx in passage_order:
+        prompt += blend_special_tokens
+        prompt += encode_without_bos(tokenizer, passage_prompts[passage_idx])
+
+    question = normalize_question(example["question"])
+    prompt += blend_special_tokens
+    prompt += encode_without_bos(
+        tokenizer,
+        f"{MUSIQUE_QUERY_PROMPT}{question}\nAnswer:",
+    )
+    return prompt
+
+
 def load_cacheblend_examples(input_dir: str, num_samples: int) -> list[tuple[int, dict]]:
     examples = []
     for sample_idx in range(1, num_samples + 1):
@@ -283,27 +332,53 @@ def load_cacheblend_examples(input_dir: str, num_samples: int) -> list[tuple[int
     return examples
 
 
+def load_musique_examples(input_path: str, num_samples: int) -> list[tuple[int, dict]]:
+    with open(input_path) as f:
+        dataset = json.load(f)
+    if num_samples > 0:
+        dataset = dataset[:num_samples]
+    return [(sample_idx, example) for sample_idx, example in enumerate(dataset, start=1)]
+
+
 def build_rag_request_plan(
     tokenizer: AutoTokenizer,
+    dataset: str,
     input_dir: str,
+    musique_input: str,
     num_samples: int,
     blend_special_tokens: list[int],
 ) -> list[tuple[str, str, list[int]]]:
     plan = []
-    for sample_idx, example in load_cacheblend_examples(input_dir, num_samples):
-        chunk_num = example["chunk_num"]
-        original_order = list(range(chunk_num))
-        reuse_order = original_order[1:] + original_order[:1]
+    if dataset == "cacheblend":
+        for sample_idx, example in load_cacheblend_examples(input_dir, num_samples):
+            chunk_num = example["chunk_num"]
+            original_order = list(range(chunk_num))
+            reuse_order = original_order[1:] + original_order[:1]
 
-        first_prompt = build_cacheblend_prompt(
-            tokenizer, example, blend_special_tokens, original_order
-        )
-        second_prompt = build_cacheblend_prompt(
-            tokenizer, example, blend_special_tokens, reuse_order
-        )
+            first_prompt = build_cacheblend_prompt(
+                tokenizer, example, blend_special_tokens, original_order
+            )
+            second_prompt = build_cacheblend_prompt(
+                tokenizer, example, blend_special_tokens, reuse_order
+            )
 
-        plan.append((f"sample {sample_idx} first", "first", first_prompt))
-        plan.append((f"sample {sample_idx} reordered", "reordered", second_prompt))
+            plan.append((f"sample {sample_idx} first", "first", first_prompt))
+            plan.append((f"sample {sample_idx} reordered", "reordered", second_prompt))
+    else:
+        for sample_idx, example in load_musique_examples(musique_input, num_samples):
+            passage_num = len(example["ctxs"])
+            original_order = list(range(passage_num))
+            reuse_order = original_order[1:] + original_order[:1]
+
+            first_prompt = build_musique_prompt(
+                tokenizer, example, blend_special_tokens, original_order
+            )
+            second_prompt = build_musique_prompt(
+                tokenizer, example, blend_special_tokens, reuse_order
+            )
+
+            plan.append((f"musique {sample_idx} first", "first", first_prompt))
+            plan.append((f"musique {sample_idx} reordered", "reordered", second_prompt))
     return plan
 
 
@@ -411,6 +486,7 @@ def run_rag_benchmark(
         args.enable_sparse,
         enable_decode_overlap_prefetch,
         decode_overlap_initial_layers=args.decode_overlap_initial_layers,
+        local_cpu_size_gb=args.local_cpu_size_gb,
     )
 
     sampling_params = SamplingParams(
@@ -469,6 +545,7 @@ def run_batched_rag_benchmark(
         enable_decode_overlap_prefetch,
         proactive_hint_file,
         decode_overlap_initial_layers=args.decode_overlap_initial_layers,
+        local_cpu_size_gb=args.local_cpu_size_gb,
     )
 
     sampling_params = SamplingParams(
@@ -579,6 +656,7 @@ def run_rag_decode_overlap_benchmark(
         enable_decode_overlap_prefetch,
         proactive_hint_file,
         decode_overlap_initial_layers=args.decode_overlap_initial_layers,
+        local_cpu_size_gb=args.local_cpu_size_gb,
     )
 
     sampling_params = SamplingParams(
@@ -932,6 +1010,16 @@ def parse_args():
             "decode-overlap CPU->GPU prefetch, and print a comparison table."
         ),
     )
+    parser.add_argument(
+        "--compare-pass",
+        choices=("both", "baseline", "prefetch"),
+        default="both",
+        help=(
+            "Select which comparison pass to run. Use 'baseline' and "
+            "'prefetch' in separate Python processes when vLLM does not "
+            "release GPU memory reliably between passes."
+        ),
+    )
 
     parser.add_argument(
         "--benchmark-mode",
@@ -954,12 +1042,27 @@ def parse_args():
         default="/home/sco/code/CacheBlend/inputs",
         help="Directory containing CacheBlend JSON samples.",
     )
+    parser.add_argument(
+        "--dataset",
+        choices=("cacheblend", "musique"),
+        default="cacheblend",
+        help="Dataset format to run.",
+    )
+    parser.add_argument(
+        "--musique-input",
+        type=str,
+        default="/home/sco/code/CacheBlend/inputs/musique_s.json",
+        help="Path to the MuSiQue JSON array.",
+    )
 
     parser.add_argument(
         "--num-samples",
         type=int,
         default=10,
-        help="Number of CacheBlend numbered samples to run.",
+        help=(
+            "Number of samples to run. For MuSiQue, use <= 0 to run the "
+            "entire JSON array."
+        ),
     )
 
     parser.add_argument(
@@ -1069,6 +1172,13 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--local-cpu-size-gb",
+        type=float,
+        default=5.0,
+        help="Maximum LMCache LocalCPU cache size in GiB.",
+    )
+
     return parser.parse_args()
 
 
@@ -1084,7 +1194,9 @@ def main():
     if args.compare_decode_overlap_prefetch:
         request_plan = build_rag_request_plan(
             tokenizer,
+            args.dataset,
             args.input_dir,
+            args.musique_input,
             args.num_samples,
             blend_special_str,
         )
@@ -1113,37 +1225,39 @@ def main():
             request_plan=request_plan,
         )
 
-        if args.benchmark_mode in {"batch", "rag-overlap", "rag-continuous"}:
-            baseline_summary, baseline_metrics = benchmark_fn(
-                name="baseline",
-                enable_decode_overlap_prefetch=False,
-                **common_kwargs,
-            )
-        else:
-            baseline_summary, baseline_metrics = benchmark_fn(
-                name="baseline",
-                enable_decode_overlap_prefetch=False,
-                measure_first_token_latency=args.measure_ttft_with_one_token,
-                **common_kwargs,
-            )
-        summaries.append(baseline_summary)
-        print_metric_table("Baseline per-request metrics", baseline_metrics)
+        if args.compare_pass in {"both", "baseline"}:
+            if args.benchmark_mode in {"batch", "rag-overlap", "rag-continuous"}:
+                baseline_summary, baseline_metrics = benchmark_fn(
+                    name="baseline",
+                    enable_decode_overlap_prefetch=False,
+                    **common_kwargs,
+                )
+            else:
+                baseline_summary, baseline_metrics = benchmark_fn(
+                    name="baseline",
+                    enable_decode_overlap_prefetch=False,
+                    measure_first_token_latency=args.measure_ttft_with_one_token,
+                    **common_kwargs,
+                )
+            summaries.append(baseline_summary)
+            print_metric_table("Baseline per-request metrics", baseline_metrics)
 
-        if args.benchmark_mode in {"batch", "rag-overlap", "rag-continuous"}:
-            prefetch_summary, prefetch_metrics = benchmark_fn(
-                name="prefetch",
-                enable_decode_overlap_prefetch=True,
-                **common_kwargs,
-            )
-        else:
-            prefetch_summary, prefetch_metrics = benchmark_fn(
-                name="prefetch",
-                enable_decode_overlap_prefetch=True,
-                measure_first_token_latency=args.measure_ttft_with_one_token,
-                **common_kwargs,
-            )
-        summaries.append(prefetch_summary)
-        print_metric_table("Prefetch per-request metrics", prefetch_metrics)
+        if args.compare_pass in {"both", "prefetch"}:
+            if args.benchmark_mode in {"batch", "rag-overlap", "rag-continuous"}:
+                prefetch_summary, prefetch_metrics = benchmark_fn(
+                    name="prefetch",
+                    enable_decode_overlap_prefetch=True,
+                    **common_kwargs,
+                )
+            else:
+                prefetch_summary, prefetch_metrics = benchmark_fn(
+                    name="prefetch",
+                    enable_decode_overlap_prefetch=True,
+                    measure_first_token_latency=args.measure_ttft_with_one_token,
+                    **common_kwargs,
+                )
+            summaries.append(prefetch_summary)
+            print_metric_table("Prefetch per-request metrics", prefetch_metrics)
         print_summary_table(summaries)
         return
 
@@ -1153,6 +1267,7 @@ def main():
         args.enable_sparse,
         args.enable_decode_overlap_prefetch,
         decode_overlap_initial_layers=args.decode_overlap_initial_layers,
+        local_cpu_size_gb=args.local_cpu_size_gb,
     )
 
     with build_llm_with_lmcache(lmcache_connector, model) as llm:
@@ -1163,31 +1278,19 @@ def main():
 
         print_output(llm, warmup_prompt, sampling_params, "warmup")
 
-        for sample_idx, example in load_cacheblend_examples(
-            args.input_dir, args.num_samples
-        ):
-            chunk_num = example["chunk_num"]
-            original_order = list(range(chunk_num))
-            reuse_order = original_order[1:] + original_order[:1]
-
-            first_prompt = build_cacheblend_prompt(
-                tokenizer, example, blend_special_str, original_order
-            )
-            second_prompt = build_cacheblend_prompt(
-                tokenizer, example, blend_special_str, reuse_order
-            )
-
-            print(f"Running CacheBlend sample {sample_idx} ({chunk_num} chunks)")
-            print_output(llm, first_prompt, sampling_params, f"sample {sample_idx} first")
-
-            time.sleep(1)
-
-            print_output(
-                llm,
-                second_prompt,
-                sampling_params,
-                f"sample {sample_idx} reordered",
-            )
+        request_plan = build_rag_request_plan(
+            tokenizer,
+            args.dataset,
+            args.input_dir,
+            args.musique_input,
+            args.num_samples,
+            blend_special_str,
+        )
+        for label, kind, prompt in request_plan:
+            print(f"Running {label} ({kind}, prompt_tokens={len(prompt)})")
+            print_output(llm, prompt, sampling_params, label)
+            if kind == "first":
+                time.sleep(1)
 
 
 if __name__ == "__main__":

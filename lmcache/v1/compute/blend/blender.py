@@ -54,6 +54,7 @@ class LMCBlender:
             imp_indices=None,
             attn_mask=None,
             positions=None,
+            kv_len=None,
         )
 
     def process_qkv(
@@ -68,6 +69,9 @@ class LMCBlender:
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
+        if self.metadata.kv_len is not None:
+            old_k = old_k[: self.metadata.kv_len]
+            old_v = old_v[: self.metadata.kv_len]
 
         if attn_output is None:
             attn_output = torch.empty(
@@ -86,6 +90,28 @@ class LMCBlender:
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
         if layer_id in self.common_metadata.check_layers:
+            if k.shape[0] != old_k.shape[0]:
+                common_len = min(k.shape[0], old_k.shape[0])
+                logger.warning(
+                    "Blend KV length mismatch at layer %s: computed=%s, "
+                    "retrieved=%s. Using common length %s.",
+                    layer_id,
+                    k.shape[0],
+                    old_k.shape[0],
+                    common_len,
+                )
+                if common_len == 0:
+                    return q, k, v, residual, attn_output, attn_metadata
+                q = q[:common_len]
+                k = k[:common_len]
+                v = v[:common_len]
+                residual = residual[:common_len]
+                old_k = old_k[:common_len]
+                old_v = old_v[:common_len]
+                self.metadata.positions = self.metadata.positions[:common_len]
+                attn_output = attn_output[:common_len]
+
+            self.metadata.kv_len = old_k.shape[0]
             diff_k = torch.sum(
                 (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
             )

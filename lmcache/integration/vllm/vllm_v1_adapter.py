@@ -809,15 +809,24 @@ class LMCacheConnectorV1Impl:
                 // self._lmcache_chunk_size
                 * self._lmcache_chunk_size
             )
+            masked_token_count = min(masked_token_count, len(tokens))
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            if masked_token_count >= lmcache_cached_tokens:
+            effective_lmcache_cached_tokens = min(lmcache_cached_tokens, len(tokens))
+            if (
+                masked_token_count >= effective_lmcache_cached_tokens
+                or not token_mask[:effective_lmcache_cached_tokens].any().item()
+            ):
                 logger.info(
-                    "Skipping LMCache load for req_id=%s because all %d LMCache "
-                    "hit tokens are already covered by vLLM cached tokens.",
+                    "Skipping LMCache load for req_id=%s because all current "
+                    "LMCache hit tokens are already covered by vLLM cached "
+                    "tokens. lmcache_cached_tokens=%d, current_tokens=%d, "
+                    "masked_tokens=%d.",
                     request.req_id,
                     lmcache_cached_tokens,
+                    len(tokens),
+                    masked_token_count,
                 )
                 continue
             if self.use_layerwise:
@@ -842,10 +851,10 @@ class LMCacheConnectorV1Impl:
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        tokens[:effective_lmcache_cached_tokens],
+                        token_mask[:effective_lmcache_cached_tokens],
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=slot_mapping[:effective_lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
@@ -853,10 +862,10 @@ class LMCacheConnectorV1Impl:
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        tokens[:effective_lmcache_cached_tokens],
+                        token_mask[:effective_lmcache_cached_tokens],
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=slot_mapping[:effective_lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
